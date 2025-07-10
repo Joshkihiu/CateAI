@@ -1,0 +1,737 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cate - Speech AI</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- three.js library -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #000000; /* Total black background */
+            color: #e2e8f0; /* Light text */
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            overflow: hidden; /* Hide scrollbars */
+        }
+
+        .ai-container {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 1;
+        }
+
+        /* three.js canvas will fill the screen */
+        #threeJsCanvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            display: block;
+            z-index: 0;
+        }
+
+        .output-display {
+            position: absolute;
+            bottom: 5%;
+            width: 80%;
+            max-width: 600px;
+            background-color: rgba(0, 0, 0, 0.6); /* Slightly darker background for text */
+            border-radius: 10px;
+            padding: 15px 20px;
+            text-align: center;
+            font-size: 1.2em;
+            color: #f8f8f2;
+            box-shadow: 0 0 20px rgba(0, 255, 255, 0.4); /* Stronger glow */
+            z-index: 2;
+            word-wrap: break-word;
+            border: 1px solid rgba(0, 255, 255, 0.2); /* Subtle border */
+        }
+
+        .output-display .placeholder-text {
+            color: #a0aec0;
+        }
+
+        /* Mic Circle - now just a visual placeholder for interaction */
+        .mic-circle-container {
+            /* Initial size, will be updated by JS */
+            width: 150px; /* Base size for click area */
+            height: 150px; /* Base size for click area */
+            background: transparent;
+            border-radius: 50%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            cursor: pointer;
+            position: absolute; /* Changed to absolute to allow positioning by JS */
+            top: 50%; /* Start centered */
+            left: 50%; /* Start centered */
+            transform: translate(-50%, -50%); /* Center based on its own size */
+            z-index: 3; /* Above three.js canvas */
+            /* No direct glow here, three.js sphere will glow */
+            pointer-events: auto; /* Ensure it's clickable */
+            transition: width 0.5s ease-in-out, height 0.5s ease-in-out, box-shadow 0.5s ease-in-out; /* Smooth transitions for size/shadow */
+        }
+
+        .mic-circle-container.done-button {
+            /* Styles for the converged button state */
+            width: 60px; /* Smaller button size */
+            height: 60px; /* Smaller button size */
+            box-shadow: 0 0 20px rgba(106, 13, 173, 1), 0 0 40px rgba(106, 13, 173, 0.8); /* Strong purple glow */
+            background-color: rgba(106, 13, 173, 0.5); /* Semi-transparent purple background */
+        }
+
+
+        /* Message box for errors/info */
+        .message-box {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background-color: rgba(44, 62, 80, 0.95);
+            border: 5px solid #e74c3c;
+            border-radius: 15px;
+            padding: 30px;
+            text-align: center;
+            box-shadow: 0 15px 30px rgba(0, 0, 0, 0.5);
+            z-index: 1000;
+            display: none;
+            animation: fadeIn 0.5s ease-out;
+            max-width: 90%;
+        }
+    </style>
+</head>
+<body class="bg-black">
+    <div class="ai-container">
+        <canvas id="threeJsCanvas"></canvas>
+
+        <!-- The micCircle now acts as an invisible overlay for click detection -->
+        <div id="micCircle" class="mic-circle-container">
+            <!-- Removed the SVG microphone icon -->
+        </div>
+
+        <div id="outputDisplay" class="output-display">
+            <p id="output" class="text-gray-200 text-lg leading-relaxed break-words whitespace-pre-wrap">
+                <span class="placeholder-text">Initializing Cate...</span>
+            </p>
+        </div>
+
+        <div id="messageBox" class="message-box hidden">
+            <h2 id="messageTitle" class="text-2xl font-bold mb-3 text-red-400"></h2>
+            <p id="messageText" class="text-lg mb-4"></p>
+            <button class="bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded-md transition" onclick="document.getElementById('messageBox').classList.add('hidden')">Close</button>
+        </div>
+    </div>
+
+    <script>
+        const outputElement = document.getElementById('output');
+        const micCircle = document.getElementById('micCircle'); // This is now the click target
+        const outputDisplay = document.getElementById('outputDisplay');
+        const messageBox = document.getElementById('messageBox');
+        const messageTitle = document.getElementById('messageTitle');
+        const messageText = document.getElementById('messageText');
+
+        let recognition;
+        let isListening = false;
+        let isUserPaused = false; // This flag indicates if the user explicitly paused via click or "pause" command
+        let speechSynth = window.speechSynthesis;
+
+        // --- three.js variables ---
+        let scene, camera, renderer;
+        let spherePoints; // Will be THREE.Points
+        let originalPositions; // To store original vertex positions
+        let currentSphereScale = 1;
+        let targetSphereScale = 0.6; // Initial smaller scale when not talking
+        const scaleSmoothness = 0.05;
+        let rotationSpeed = 0.001; // Initial subtle rotation
+
+        let speechDistortionAmount = 0; // Controls how much vertices are displaced
+        let targetDistortionAmount = 0.02; // Initial subtle distortion for "final morph" look
+        const distortionSmoothness = 0.1;
+        let distortionSpeed = 5; // Speed of the distortion animation
+
+        let animationFrameId; // To control the animation loop
+        let isAnimationRunning = true; // Flag to control if animation loop should run
+
+        let customSphereColor = null; // Stores user-commanded color, null if default
+
+        // New variables for "done" state animation
+        let isDoneStateActive = false;
+        let targetSpherePosition = new THREE.Vector3(0, 0, 0); // Sphere's target 3D position (world coordinates)
+        const positionSmoothness = 0.05; // How smoothly the sphere moves to target position
+
+
+        // For morphing to button shape
+        let targetFlattening = 1.0; // 1.0 means no flattening, 0.1 means very flat
+        let currentFlattening = 1.0;
+        const flatteningSmoothness = 0.05;
+
+
+        // --- three.js setup ---
+        function initThreeJs() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            renderer = new THREE.WebGLRenderer({ canvas: document.getElementById('threeJsCanvas'), antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+
+            // Create the sphere geometry with a slightly larger base radius
+            const geometry = new THREE.SphereGeometry(1.2, 64, 64); // Increased radius from 1.0 to 1.2
+            originalPositions = geometry.attributes.position.array.slice(); // Store original positions
+
+            const material = new THREE.PointsMaterial({
+                color: 0x00ffff, // Cyan glow (blueish) - Default color
+                size: 0.05, // Size of each point
+                transparent: true,
+                opacity: 0.7,
+                blending: THREE.AdditiveBlending // For glowing effect
+            });
+
+            spherePoints = new THREE.Points(geometry, material);
+            scene.add(spherePoints);
+
+            camera.position.z = 5;
+
+            // Handle window resizing for three.js
+            window.addEventListener('resize', onWindowResize, false);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            // Recalculate target position for "done" state if needed
+            if (isDoneStateActive) {
+                setDoneTargetPosition();
+            }
+        }
+
+        // Sets the target 3D position for the sphere when "done"
+        function setDoneTargetPosition() {
+            // Convert a screen coordinate (e.g., bottom right) to a 3D world coordinate
+            // Assuming the button should appear near the bottom right corner
+            const screenX = window.innerWidth * 0.85; // 85% from left
+            const screenY = window.innerHeight * 0.85; // 85% from top
+
+            const vector = new THREE.Vector3();
+            vector.set(
+                (screenX / window.innerWidth) * 2 - 1,
+                -(screenY / window.innerHeight) * 2 + 1,
+                0.5 // A small Z value to ensure it's in front of the camera
+            );
+            vector.unproject(camera); // Convert screen to world coordinates
+
+            targetSpherePosition.copy(vector);
+        }
+
+
+        // --- three.js animation loop ---
+        function animateThreeJs(time) {
+            if (!isAnimationRunning) {
+                animationFrameId = null;
+                return;
+            }
+            animationFrameId = requestAnimationFrame(animateThreeJs);
+
+            // Smoothly interpolate sphere scale
+            currentSphereScale += (targetSphereScale - currentSphereScale) * scaleSmoothness;
+            // Smoothly interpolate flattening
+            currentFlattening += (targetFlattening - currentFlattening) * flatteningSmoothness;
+
+            spherePoints.scale.set(currentSphereScale, currentSphereScale * currentFlattening, currentSphereScale); // Apply flattening on Y-axis
+
+            // Smoothly interpolate distortion amount
+            speechDistortionAmount += (targetDistortionAmount - speechDistortionAmount) * distortionSmoothness;
+
+            // Apply vertex distortion if speech is active
+            if (speechDistortionAmount > 0.001) { // Only distort if there's a target amount
+                const positions = spherePoints.geometry.attributes.position.array;
+                for (let i = 0; i < positions.length; i += 3) {
+                    const x = originalPositions[i];
+                    const y = originalPositions[i + 1];
+                    const z = originalPositions[i + 2];
+
+                    // Simple sine wave distortion based on time and position
+                    const distortionFactor = Math.sin(time * 0.001 * distortionSpeed + i * 0.1) * speechDistortionAmount;
+
+                    // Displace vertices along their normal (or just radially for simplicity)
+                    const magnitude = Math.sqrt(x*x + y*y + z*z);
+                    positions[i] = x + (x / magnitude) * distortionFactor;
+                    positions[i + 1] = y + (y / magnitude) * distortionFactor;
+                    positions[i + 2] = z + (z / magnitude) * distortionFactor;
+                }
+                spherePoints.geometry.attributes.position.needsUpdate = true; // Tell three.js to update buffer
+            } else if (speechDistortionAmount < 0.001 && spherePoints.geometry.attributes.position.array !== originalPositions) {
+                // Reset positions if distortion is minimal to avoid floating point errors over time
+                // This check prevents unnecessary array copying if already reset
+                spherePoints.geometry.attributes.position.array.set(originalPositions);
+                spherePoints.geometry.attributes.position.needsUpdate = true;
+            }
+
+            // Animate sphere position if in "done" state
+            if (isDoneStateActive) {
+                spherePoints.position.lerp(targetSpherePosition, positionSmoothness); // Linear interpolation
+
+                // Update micCircle position and size to follow the sphere and become button
+                const vector = spherePoints.position.clone();
+                vector.project(camera); // Convert world to NDC
+                const x = (vector.x * 0.5 + 0.5) * renderer.domElement.clientWidth;
+                const y = (-vector.y * 0.5 + 0.5) * renderer.domElement.clientHeight;
+
+                micCircle.style.left = `${x}px`;
+                micCircle.style.top = `${y}px`;
+                micCircle.style.width = '60px'; // Fixed button size
+                micCircle.style.height = '60px'; // Fixed button size
+                micCircle.classList.add('done-button'); // Apply button specific styles
+                micCircle.style.transform = `translate(-50%, -50%)`; // Keep centered
+            } else {
+                 // Reset spherePoints position if not in done state
+                 spherePoints.position.set(0, 0, 0);
+                 micCircle.style.left = `50%`;
+                 micCircle.style.top = `50%`;
+                 micCircle.style.width = '150px'; // Reset to default click area size
+                 micCircle.style.height = '150px'; // Reset to default click area size
+                 micCircle.classList.remove('done-button'); // Remove button specific styles
+                 micCircle.style.transform = `translate(-50%, -50%)`; // Reset transform
+            }
+
+
+            // Rotate the sphere
+            spherePoints.rotation.x += rotationSpeed;
+            spherePoints.rotation.y += rotationSpeed * 0.5;
+
+            renderer.render(scene, camera);
+        }
+
+        // --- Core AI Logic ---
+
+        // Function to show a custom message box
+        function showMessage(title, message) {
+            messageTitle.textContent = title;
+            messageText.textContent = message;
+            messageBox.classList.remove('hidden');
+        }
+
+        // Function to speak text using Web Speech Synthesis
+        function speak(text) {
+            if (speechSynth.speaking) {
+                speechSynth.cancel();
+            }
+            const utterance = new SpeechSynthesisUtterance(text);
+            utterance.lang = 'en-US';
+            utterance.rate = 1.0;
+            utterance.pitch = 1.0;
+            speechSynth.speak(utterance);
+        }
+
+        // Function to ask Gemini API for a response
+        async function askGemini(prompt) {
+            outputElement.innerHTML = '<span class="placeholder-text">Thinking...</span>';
+            speak("Thinking...");
+
+            let chatHistory = [];
+            chatHistory.push({ role: "user", parts: [{ text: prompt }] });
+            const payload = { contents: chatHistory };
+            const apiKey = ""; // Canvas will provide this at runtime
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+
+            try {
+                const response = await fetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(`API error: ${response.status} ${response.statusText} - ${JSON.stringify(errorData)}`);
+                }
+
+                const result = await response.json();
+                if (result.candidates && result.candidates.length > 0 &&
+                    result.candidates[0].content && result.candidates[0].content.parts &&
+                    result.candidates[0].content.parts.length > 0) {
+                    const text = result.candidates[0].content.parts[0].text;
+                    outputElement.innerHTML = text;
+                    speak(text);
+                } else {
+                    outputElement.innerHTML = '<span class="placeholder-text">No response from AI.</span>';
+                    speak("I'm sorry, I couldn't generate a response.");
+                }
+            } catch (error) {
+                console.error('Error calling Gemini API:', error);
+                outputElement.innerHTML = '<span class="placeholder-text">Error communicating with AI.</span>';
+                speak("I'm sorry, I encountered an error. Please try again.");
+                showMessage('AI Error', 'Failed to get a response from the AI. Check console for details.');
+            }
+        }
+
+        // Function to start speech recognition
+        function startRecognition() {
+            if (recognition && !isListening && !isUserPaused) {
+                try {
+                    recognition.start();
+                    outputElement.innerHTML = '<span class="placeholder-text">Listening for your command...</span>';
+                    speechSynth.cancel(); // Stop any speech when starting to listen
+                } catch (e) {
+                    if (e.name !== 'InvalidStateError') {
+                        console.error("Error starting recognition:", e);
+                        showMessage('Recognition Error', 'Could not start listening. Please try refreshing the page.');
+                    }
+                }
+            }
+        }
+
+        // Function to apply visual state based on current activity
+        function applyVisualState(state) {
+            if (isUserPaused) {
+                targetSphereScale = 0.2; // Sphere shrinks even more when explicitly paused
+                spherePoints.material.color.setHex(0xff79c6); // Pink when paused
+                targetDistortionAmount = 0; // No distortion when paused
+                rotationSpeed = 0.001; // Slow rotation when paused
+                isAnimationRunning = false; // Stop animation completely
+                cancelAnimationFrame(animationFrameId);
+                animationFrameId = null;
+            } else {
+                isAnimationRunning = true;
+                if (!animationFrameId) {
+                    animateThreeJs(performance.now());
+                }
+
+                if (isDoneStateActive && state !== 'done') {
+                    spherePoints.position.set(0, 0, 0); // Reset to center
+                    isDoneStateActive = false;
+                }
+
+                switch (state) {
+                    case 'idle': // When recognition is not active or just ended
+                        targetSphereScale = 0.4; // Smallest idle size
+                        rotationSpeed = 0.001; // Slowest rotation
+                        spherePoints.material.color.setHex(0x00ffff); // Cyan glow (blueish)
+                        targetDistortionAmount = 0.02; // Initial subtle distortion
+                        customSphereColor = null; // Reset custom color
+                        break;
+                    case 'listening': // When recognition is active but no speech detected
+                        targetSphereScale = 0.6; // Slightly larger for active listening
+                        rotationSpeed = 0.005; // Faster rotation when listening
+                        if (customSphereColor === null) {
+                            spherePoints.material.color.setHex(0x00ffff); // Cyan glow
+                        }
+                        targetDistortionAmount = 0.02; // Subtle distortion
+                        break;
+                    case 'speaking':
+                        targetSphereScale = 1.2; // Sphere expands more when speaking
+                        targetDistortionAmount = 0.1; // Start distortion for liquid effect
+                        spherePoints.material.color.setHex(0x00ff00); // Greenish glow when speaking (overrides custom color temporarily)
+                        rotationSpeed = 0.008; // Even faster rotation when speaking
+                        break;
+                    case 'command': // When a specific command is being processed (visuals set by command)
+                        // Do nothing here, as command logic directly sets these
+                        break;
+                    case 'done': // Specific state for "done" command
+                        isDoneStateActive = true;
+                        setDoneTargetPosition(); // Set the target position for the sphere
+                        targetSphereScale = 0.3; // Very small for the button
+                        targetDistortionAmount = 0; // No distortion for button look
+                        rotationSpeed = 0; // Stop rotation
+                        spherePoints.material.color.setHex(0x6a0dad); // Button color (darker blue/purple)
+                        customSphereColor = null; // Reset custom color
+                        break;
+                }
+            }
+        }
+
+
+        // Check for Web Speech API compatibility
+        if ('webkitSpeechRecognition' in window) {
+            recognition = new webkitSpeechRecognition();
+            recognition.continuous = true;
+            recognition.interimResults = true;
+            recognition.lang = 'en-US';
+
+            recognition.onresult = (event) => {
+                let interimTranscript = '';
+                let finalTranscript = '';
+
+                for (let i = event.resultIndex; i < event.results.length; ++i) {
+                    const transcript = event.results[i][0].transcript;
+                    if (event.results[i].isFinal) {
+                        finalTranscript += transcript;
+                    } else {
+                        interimTranscript += transcript;
+                    }
+                }
+                outputElement.innerHTML = finalTranscript + '<span class="placeholder-text">' + interimTranscript + '</span>';
+
+                if (finalTranscript) {
+                    const lowerTranscript = finalTranscript.toLowerCase().trim();
+                    let commandRecognized = false; // Flag to check if a specific command was found
+
+                    // --- Handle specific commands ---
+                    if (lowerTranscript.includes('spin faster')) {
+                        rotationSpeed = Math.min(rotationSpeed + 0.005, 0.05); // Increase rotation speed, cap it
+                        speak("Spinning faster.");
+                        outputElement.innerHTML = 'Spinning faster.';
+                        commandRecognized = true;
+                    } else if (lowerTranscript.includes('original form') || lowerTranscript.includes('go back')) {
+                        targetSphereScale = 0.6; // Default idle size
+                        targetDistortionAmount = 0.02; // Default subtle distortion
+                        rotationSpeed = 0.001; // Default slow rotation
+                        spherePoints.material.color.setHex(0x00ffff); // Default blue color
+                        customSphereColor = null; // Reset custom color
+                        speak("Returning to original form.");
+                        outputElement.innerHTML = 'Returning to original form.';
+                        commandRecognized = true;
+                    } else if (lowerTranscript.includes('expand')) {
+                        targetSphereScale = Math.min(targetSphereScale + 0.3, 2.0); // Increase size, cap it
+                        targetDistortionAmount = Math.min(targetDistortionAmount + 0.02, 0.15); // More distortion
+                        speak("Expanding.");
+                        outputElement.innerHTML = 'Expanding.';
+                        commandRecognized = true;
+                    } else if (lowerTranscript.includes('small')) {
+                        targetSphereScale = Math.max(targetSphereScale - 0.2, 0.1); // Decrease size, set min
+                        speak("Making it small.");
+                        outputElement.innerHTML = 'Making it small.';
+                        commandRecognized = true;
+                    } else if (lowerTranscript.includes('smaller')) {
+                        targetSphereScale = Math.max(targetSphereScale - 0.2, 0.1); // Decrease size further
+                        speak("Making it smaller.");
+                        outputElement.innerHTML = 'Making it smaller.';
+                        commandRecognized = true;
+                    } else if (lowerTranscript.includes('bigger')) { // New "bigger" command
+                        targetSphereScale = Math.min(targetSphereScale + 0.2, 2.0); // Increase size, cap it
+                        speak("Making it bigger.");
+                        outputElement.innerHTML = 'Making it bigger.';
+                        commandRecognized = true;
+                    }
+                    else if (lowerTranscript.includes('make it red')) {
+                        customSphereColor = 0xff0000;
+                        spherePoints.material.color.setHex(customSphereColor);
+                        speak("Changing color to red.");
+                        outputElement.innerHTML = 'Changing color to red.';
+                        commandRecognized = true;
+                    } else if (lowerTranscript.includes('make it green')) {
+                        customSphereColor = 0x00ff00;
+                        spherePoints.material.color.setHex(customSphereColor);
+                        speak("Changing color to green.");
+                        outputElement.innerHTML = 'Changing color to green.';
+                        commandRecognized = true;
+                    } else if (lowerTranscript.includes('make it blue')) {
+                        customSphereColor = 0x0000ff; // Darker blue
+                        spherePoints.material.color.setHex(customSphereColor);
+                        speak("Changing color to blue.");
+                        outputElement.innerHTML = 'Changing color to blue.';
+                        commandRecognized = true;
+                    } else if (lowerTranscript.includes('make it purple')) {
+                        customSphereColor = 0x800080;
+                        spherePoints.material.color.setHex(customSphereColor);
+                        speak("Changing color to purple.");
+                        outputElement.innerHTML = 'Changing color to purple.';
+                        commandRecognized = true;
+                    } else if (lowerTranscript.includes('make it pink')) {
+                        customSphereColor = 0xffc0cb;
+                        spherePoints.material.color.setHex(customSphereColor);
+                        speak("Changing color to pink.");
+                        outputElement.innerHTML = 'Changing color to pink.';
+                        commandRecognized = true;
+                    } else if (lowerTranscript.includes('make it yellow')) {
+                        customSphereColor = 0xffff00;
+                        spherePoints.material.color.setHex(customSphereColor);
+                        speak("Changing color to yellow.");
+                        outputElement.innerHTML = 'Changing color to yellow.';
+                        commandRecognized = true;
+                    } else if (lowerTranscript.includes('make it orange')) {
+                        customSphereColor = 0xffa500;
+                        spherePoints.material.color.setHex(customSphereColor);
+                        speak("Changing color to orange.");
+                        outputElement.innerHTML = 'Changing color to orange.';
+                        commandRecognized = true;
+                    } else if (lowerTranscript.includes('make it white')) {
+                        customSphereColor = 0xffffff;
+                        spherePoints.material.color.setHex(customSphereColor);
+                        speak("Changing color to white.");
+                        outputElement.innerHTML = 'Changing color to white.';
+                        commandRecognized = true;
+                    } else if (lowerTranscript.includes('nice')) {
+                        targetSphereScale = 0.6; // Default idle size
+                        targetDistortionAmount = 0.02; // Default subtle distortion
+                        rotationSpeed = 0.001; // Default slow rotation
+                        spherePoints.material.color.setHex(0x00ffff); // Default blue color
+                        customSphereColor = null; // Reset custom color
+                        speak("Thank you!");
+                        outputElement.innerHTML = 'Thank you!';
+                        commandRecognized = true;
+                    } else if (lowerTranscript.includes('stop')) { // Stop command
+                        isUserPaused = true; // Set user paused flag
+                        // Do NOT call recognition.stop() here, only animation
+                        speechSynth.cancel();
+                        micCircle.classList.add('paused');
+                        outputElement.innerHTML = '<span class="placeholder-text">Cate is stopped. Click the sphere to continue.</span>';
+                        applyVisualState('paused'); // Apply paused state visuals
+                        speak("Stopping animation."); // Clarify what is stopping
+                        commandRecognized = true;
+                    } else if (lowerTranscript.includes('continue')) { // Continue command
+                        if (isUserPaused) {
+                            isUserPaused = false; // Unset user paused flag
+                            micCircle.classList.remove('paused');
+                            // Do NOT call startRecognition() here, as it should already be listening if only animation was stopped
+                            outputElement.innerHTML = '<span class="placeholder-text">Continuing.</span>';
+                            applyVisualState('listening'); // Apply listening state visuals
+                            speak("Continuing animation."); // Clarify what is continuing
+                        } else {
+                            outputElement.innerHTML = '<span class="placeholder-text">I am not stopped.</span>';
+                            speak("I am not stopped.");
+                        }
+                        commandRecognized = true;
+                    } else if (lowerTranscript.includes('done')) { // DONE command
+                        isUserPaused = true; // Stop recognition
+                        if (isListening) {
+                            recognition.stop();
+                        }
+                        speechSynth.cancel();
+                        micCircle.classList.add('paused'); // Visual cue for paused state
+                        outputElement.innerHTML = '<span class="placeholder-text">Cate is done. Click the sphere to re-engage.</span>';
+                        applyVisualState('done'); // Apply done state visuals
+                        speak("I am done. Click the sphere to re-engage.");
+                        commandRecognized = true;
+                    }
+
+                    // If no specific command was recognized, and it was addressed to Cate, ask Gemini
+                    if (!commandRecognized && (lowerTranscript.startsWith('cate') || lowerTranscript.startsWith('hey cate'))) {
+                        const commandText = lowerTranscript.replace(/^(cate|hey cate),?\s*/, '').trim();
+                        if (commandText) {
+                            askGemini(commandText); // Call Gemini with the general query
+                        } else {
+                            outputElement.innerHTML = '<span class="placeholder-text">Yes? How can I help?</span>';
+                            speak("Yes? How can I help?");
+                        }
+                    } else if (!commandRecognized) {
+                        // If it's not a command and not addressed to Cate, just display the text
+                        outputElement.innerHTML = finalTranscript;
+                    }
+                }
+            };
+
+            recognition.onstart = () => {
+                isListening = true;
+                micCircle.classList.remove('paused');
+                applyVisualState('listening'); // Apply listening state visuals
+            };
+
+            recognition.onspeechstart = () => {
+                applyVisualState('speaking'); // Apply speaking state visuals
+            };
+
+            recognition.onspeechend = () => {
+                // After speech ends, if a custom color is set, revert to it. Otherwise, use default listening color.
+                if (customSphereColor !== null) {
+                    spherePoints.material.color.setHex(customSphereColor);
+                } else {
+                    spherePoints.material.color.setHex(0x00ffff); // Default blue
+                }
+                applyVisualState('listening'); // Go back to listening idle state
+            };
+
+            recognition.onend = () => {
+                isListening = false;
+                // After recognition ends, if a custom color is set, revert to it. Otherwise, use default idle color.
+                if (customSphereColor !== null) {
+                    spherePoints.material.color.setHex(customSphereColor);
+                } else {
+                    spherePoints.material.color.setHex(0x00ffff); // Default blue
+                }
+                applyVisualState('idle'); // Go to full idle state
+                outputElement.innerHTML = '<span class="placeholder-text">Listening for your command...</span>';
+
+                if (!isUserPaused) { // Only try to restart recognition if not explicitly paused by user
+                    setTimeout(startRecognition, 500);
+                } else {
+                    // If user paused recognition explicitly (by clicking or "done" command), don't restart it
+                    outputElement.innerHTML = '<span class="placeholder-text">Cate is paused. Click the sphere to resume.</span>';
+                }
+            };
+
+            recognition.onerror = (event) => {
+                console.error('Speech recognition error:', event.error);
+                let errorMessage = 'An unknown error occurred.';
+                if (event.error === 'not-allowed') {
+                    errorMessage = 'Please allow microphone access to use speech recognition.';
+                    isUserPaused = true;
+                    micCircle.classList.add('paused'); // Show paused state visually
+                } else if (event.error === 'no-speech') {
+                    // Do nothing for no-speech errors, it's an expected behavior for always-on listening
+                    return;
+                } else if (event.error === 'network') {
+                    errorMessage = 'Network error. Please check your internet connection.';
+                } else if (event.error === 'aborted') {
+                    return;
+                }
+                showMessage('Recognition Error', errorMessage);
+
+                isListening = false;
+                // On error, if a custom color is set, revert to it. Otherwise, use default idle color.
+                if (customSphereColor !== null) {
+                    spherePoints.material.color.setHex(customSphereColor);
+                } else {
+                    spherePoints.material.color.setHex(0x00ffff); // Default blue
+                }
+                applyVisualState('idle'); // Go to idle state on error
+                outputElement.innerHTML = '<span class="placeholder-text">Listening for your command...</span>';
+
+                if (!isUserPaused) { // Only try to restart recognition if not explicitly paused by user
+                    setTimeout(startRecognition, 1000);
+                } else {
+                    outputElement.innerHTML = '<span class="placeholder-text">Cate is paused. Click the sphere to resume.</span>';
+                }
+            };
+
+            micCircle.addEventListener('click', () => {
+                if (isUserPaused) {
+                    // If paused by click/command, resume both recognition AND animation
+                    isUserPaused = false;
+                    micCircle.classList.remove('paused');
+                    startRecognition(); // Restart recognition
+                    outputElement.innerHTML = '<span class="placeholder-text">Resuming.</span>';
+                    applyVisualState('listening'); // Apply listening state visuals
+                    speak("Resuming.");
+                } else {
+                    // If not paused, pause both recognition AND animation
+                    isUserPaused = true;
+                    if (isListening) {
+                        recognition.stop(); // Stop recognition
+                    }
+                    speechSynth.cancel();
+                    micCircle.classList.add('paused');
+                    outputElement.innerHTML = '<span class="placeholder-text">Cate is paused. Click the sphere to continue.</span>';
+                    applyVisualState('paused'); // Apply paused state visuals
+                    speak("Pausing.");
+                }
+            });
+
+            // Initial setup
+            window.addEventListener('load', () => {
+                initThreeJs(); // Initialize three.js
+                applyVisualState('idle'); // Set initial visual state (idle)
+                startRecognition(); // Attempt to start recognition
+            });
+        } else {
+            // Fallback for unsupported browsers
+            micCircle.style.pointerEvents = 'none';
+            micCircle.style.opacity = '0.5';
+            showMessage('Browser Not Supported', 'Your browser does not support the Web Speech API. Please try Chrome or Edge.');
+            outputElement.innerHTML = '<span class="text-red-400">Speech Recognition Not Supported.</span>';
+        }
+    </script>
+</body>
+</html>
